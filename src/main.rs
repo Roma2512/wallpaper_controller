@@ -1,8 +1,14 @@
+mod backend;
+mod widgets;
+
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::process::{Child, Command};
 use eframe::egui;
+
+use widgets::info::InfoWidget;
+use widgets::wallapers::WallpapersWidget;
 
 #[derive(Clone)]
 enum TrayCommand {
@@ -10,74 +16,36 @@ enum TrayCommand {
     Quit,
 }
 
-#[derive(PartialEq)]
-enum WallpaperType {
-    Static,
-    Live,
-}
-
 struct App {
     rx: Arc<Mutex<Receiver<TrayCommand>>>,
-    current_mode: WallpaperType,
-    static_path: String,
-    live_path: String,
-    // Указатель на запущенный процесс живых обоев (например, mpvpaper или live-paper)
-    live_process: Option<Child>,
+    wallpapers: WallpapersWidget,
+    info: InfoWidget,
+    wallpapers_dir: PathBuf,
 }
 
 impl App {
-    // Функция применения статических обоев (пример для GNOME / feh)
-    fn apply_static_wallpaper(&mut self, path: &str) {
-        self.stop_live_wallpaper();
-        println!("Установка статических обоев: {}", path);
-
-        // Пример для GNOME (можно заменить на feh, nitrogen и т.д.):
-        let _ = Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.background",
-                "picture-uri",
-                &format!("file://{}", path),
-            ])
-            .spawn();
-    }
-
-    // Функция запуска живых обоев
-    fn start_live_wallpaper(&mut self, path: &str) {
-        self.stop_live_wallpaper();
-        println!("Запуск живых обоев: {}", path);
-
-        // Пример запуска через mpvpaper или вашу утилиту live-paper:
-        // Замените "mpvpaper" на ту команду, которую использует live-paper в вашей системе
-        let child = Command::new("mpvpaper")
-            .args(["-o", "no-audio loop", "DP-1", path]) // Пример для mpvpaper
-            .spawn();
-
-        match child {
-            Ok(process) => {
-                self.live_process = Some(process);
-            }
-            Err(e) => {
-                eprintln!("Не удалось запустить живые обои: {}", e);
-            }
-        }
-    }
-
-    // Остановка процесса живых обоев
-    fn stop_live_wallpaper(&mut self) {
-        if let Some(mut process) = self.live_process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
-            println!("Живые обои остановлены.");
+    fn new(rx: Arc<Mutex<Receiver<TrayCommand>>>) -> Self {
+        let wallpapers_dir = dirs_wallpapers_dir();
+        let mut wallpapers = WallpapersWidget::default();
+        wallpapers.load_from_dir(&wallpapers_dir);
+        Self {
+            rx,
+            wallpapers,
+            info: InfoWidget::default(),
+            wallpapers_dir,
         }
     }
 }
 
-impl Drop for App {
-    fn drop(&mut self) {
-        // Гарантированно гасим процесс обоев при выходе из приложения
-        self.stop_live_wallpaper();
+fn dirs_wallpapers_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(&home).join("Pictures").join("Wallpapers");
+        if p.is_dir() {
+            return p;
+        }
+        return PathBuf::from(home).join(".local/share/wallpapers");
     }
+    PathBuf::from("wallpapers")
 }
 
 impl eframe::App for App {
@@ -85,7 +53,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         ctx.request_repaint();
 
-        // Обработка команд из трея
+        // Обработка команд системного трея
         if let Ok(mut rx) = self.rx.try_lock() {
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
@@ -94,58 +62,34 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     TrayCommand::Quit => {
-                        self.stop_live_wallpaper();
                         std::process::exit(0);
                     }
                 }
             }
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Контроллер обоев (Linux)");
-            ui.add_space(10.0);
+        // Правая панель: информация о выбранных обоях
+        egui::Panel::right("info_panel")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(260.0)
+            .show(ui, |ui| {
+                let selected = self.wallpapers.selected_path().map(|p| p.to_path_buf());
+                self.info.set_selected(&ctx, selected.as_deref());
 
-            ui.horizontal(|ui| {
-                if ui.selectable_label(self.current_mode == WallpaperType::Static, "Статические обои").clicked() {
-                    self.current_mode = WallpaperType::Static;
-                }
-                if ui.selectable_label(self.current_mode == WallpaperType::Live, "Живые обои").clicked() {
-                    self.current_mode = WallpaperType::Live;
-                }
-            });
-
-            ui.separator();
-
-            match self.current_mode {
-                WallpaperType::Static => {
-                    ui.label("Путь к изображению:");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.static_path);
-                        if ui.button("Применить").clicked() {
-                            let path = self.static_path.clone();
-                            self.apply_static_wallpaper(&path);
-                        }
-                    });
-                }
-                WallpaperType::Live => {
-                    ui.label("Путь к видео / анимации:");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.live_path);
-                        if ui.button("Запустить").clicked() {
-                            let path = self.live_path.clone();
-                            self.start_live_wallpaper(&path);
-                        }
-                    });
-                    if ui.button("Остановить живые обои").clicked() {
-                        self.stop_live_wallpaper();
+                if self.info.ui(ui) {
+                    if let Some(p) = self.wallpapers.selected_path() {
+                        backend::mpvpaper::apply(p);
+                        self.info.status = Some(format!(
+                            "✓ Применено: {}",
+                            p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
                     }
                 }
-            }
-
-            ui.add_space(20.0);
-            if ui.button("Свернуть в трей").clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            }
+            });
+        
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.wallpapers.ui(ui);
         });
     }
 }
@@ -163,15 +107,16 @@ fn spawn_tray(tx: Sender<TrayCommand>) {
             px[o + 2] = (255 * a / 255) as u8;
             px[o + 3] = a as u8;
         }
+
         let icon = muri::Icon::from_png(fb.encode_png());
 
         let menu = muri::Menu::new()
-            .row(muri::Row::new("show").label("Показать окно"))
-            .row(muri::Row::new("quit").label("Выход"));
+            .row(muri::Row::new("show").label("Show Window"))
+            .row(muri::Row::new("quit").label("Quit"));
 
         let tx_clone = tx.clone();
         let tray = muri::Tray::new(icon)
-            .tooltip("Wallpaper Controller")
+            .tooltip("test")
             .menu(menu)
             .on_click(move |id| {
                 match id.as_str() {
@@ -195,22 +140,16 @@ fn main() {
     loop {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([400.0, 300.0])
-                .with_resizable(false),
+                .with_inner_size([1100.0, 700.0])
+                .with_transparent(true),
             ..Default::default()
         };
 
         let rx_clone = Arc::clone(&rx);
         let _ = eframe::run_native(
-            "Wallpaper Controller",
+            "Wallpaper Manager",
             options,
-            Box::new(move |_cc| Ok(Box::new(App {
-                rx: rx_clone,
-                current_mode: WallpaperType::Static,
-                static_path: String::new(),
-                live_path: String::new(),
-                live_process: None,
-            }))),
+            Box::new(move |_cc| Ok(Box::new(App::new(rx_clone)))),
         );
 
         match rx.lock().unwrap().recv() {
